@@ -1,12 +1,12 @@
 # Конфиг сборки для Railway (Nixpacks).
-# КЛЮЧЕВОЕ: pytesseract требует СИСТЕМНЫЙ бинарник tesseract и русский языковой
-# пакет. Ставим их на этапе сборки, иначе OCR не заработает.
+#
+# Единственное, что нам нужно доопределить, — СИСТЕМНЫЕ пакеты OCR: pytesseract
+# требует бинарник tesseract и русский языковой пакет. Добавляем их к фазе setup.
+#
+# Установку Python-зависимостей и запуск НЕ переопределяем: Nixpacks сам
+# детектит requirements.txt, создаёт venv и ставит зависимости через pip
+# (если переопределить install своим `pip install`, pip окажется не на PATH —
+# именно из-за этого падала сборка). Стартовая команда берётся из railway.json
+# (startCommand = "python main.py") / Procfile.
 [phases.setup]
 aptPkgs = ["tesseract-ocr", "tesseract-ocr-rus"]
-
-[phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
-
-[start]
-# Worker-процесс (не web): публичный HTTP-эндпоинт не нужен, используется polling.
-cmd = "python main.py"
