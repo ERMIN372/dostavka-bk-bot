@@ -3,10 +3,18 @@
 Память диалога НЕ ведётся: каждое сообщение обрабатывается независимо.
 Логи вопросов пользователей НЕ пишутся ни в файл, ни в БД. В stdout идут только
 служебные логи (старт, факт получения сообщения, ошибки).
+
+Защита от флуда/перегрузки (см. throttling.py):
+  * per-user rate limit — от спама одним пользователем;
+  * глобальный лимит вызовов YandexGPT в минуту — предохранитель бюджета;
+  * CPU-bound эмбеддинг вынесен из event loop (to_thread) и ограничен семафором,
+    иначе один тяжёлый запрос замораживает бот для ВСЕХ пользователей;
+  * ограничение длины вопроса.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -16,6 +24,7 @@ from aiogram.types import Message
 
 from .indexer import Index
 from .retriever import SIMILARITY_THRESHOLD, retrieve
+from .throttling import GlobalRateLimiter, UserRateLimiter
 from . import yandex_gpt
 
 logger = logging.getLogger(__name__)
@@ -35,10 +44,33 @@ WELCOME_MESSAGE = (
     "Задайте вопрос по инструкции доставки обычным текстом — я найду ответ в базе знаний."
 )
 
+RATE_LIMIT_MESSAGE = (
+    "Слишком много запросов подряд. Подождите немного и задайте вопрос снова."
+)
+
+OVERLOAD_MESSAGE = (
+    "Сейчас слишком много обращений к боту. Попробуйте через пару минут."
+)
+
+# Максимальная длина вопроса. Реальные вопросы сотрудников короткие; всё длиннее —
+# либо вставленный текст, либо флуд. Экономит CPU (эмбеддинг) и токены YandexGPT.
+MAX_QUESTION_LEN = 500
+
+# Параллелизм тяжёлых операций:
+#   эмбеддинг — CPU-bound, на Railway обычно 1-2 vCPU, больше 2 потоков смысла нет;
+#   YandexGPT — сетевые вызовы, ограничиваем, чтобы не копить сотни висящих задач.
+EMBED_CONCURRENCY = 2
+GPT_CONCURRENCY = 4
+
 
 def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
     """Создаёт Dispatcher с внедрёнными индексом и моделью эмбеддингов."""
     dp = Dispatcher()
+
+    user_limiter = UserRateLimiter()
+    gpt_limiter = GlobalRateLimiter()
+    embed_sem = asyncio.Semaphore(EMBED_CONCURRENCY)
+    gpt_sem = asyncio.Semaphore(GPT_CONCURRENCY)
 
     @dp.message(Command("start", "help"))
     async def on_start(message: Message) -> None:
@@ -49,6 +81,23 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
         question = (message.text or "").strip()
         logger.info("Получено сообщение (len=%d)", len(question))  # без содержимого вопроса
         if not question:
+            return
+
+        # --- Анти-флуд: per-user лимит. Срабатывает ДО любых тяжёлых операций. ---
+        user_id = message.from_user.id if message.from_user else 0
+        allowed, warn = user_limiter.check(user_id)
+        if not allowed:
+            if warn:
+                await message.answer(RATE_LIMIT_MESSAGE)
+            # Повторные нарушения в том же окне игнорируем молча,
+            # чтобы не отвечать флудом на флуд.
+            return
+
+        if len(question) > MAX_QUESTION_LEN:
+            await message.answer(
+                f"Вопрос слишком длинный (максимум {MAX_QUESTION_LEN} символов). "
+                "Сформулируйте короче."
+            )
             return
 
         # Мгновенная обратная связь: сообщение-«раздумье». Отправляем сразу, чтобы
@@ -67,7 +116,15 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
             await message.answer(text)
 
         try:
-            result = retrieve(index, embedding_model, question, threshold=SIMILARITY_THRESHOLD)
+            # Эмбеддинг — синхронный CPU-bound вызов. Уводим его в поток, чтобы не
+            # блокировать event loop (иначе на время encode бот виснет для всех),
+            # и ограничиваем параллелизм семафором, чтобы наплыв запросов
+            # не устроил CPU-давку на 1-2 ядрах контейнера.
+            async with embed_sem:
+                result = await asyncio.to_thread(
+                    retrieve, index, embedding_model, question,
+                    threshold=SIMILARITY_THRESHOLD,
+                )
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка на этапе retrieval")
             await reply("Произошла внутренняя ошибка при поиске. Попробуйте позже.")
@@ -78,8 +135,15 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
             await reply(NO_ANSWER_MESSAGE)
             return
 
+        # --- Предохранитель бюджета: глобальный лимит вызовов YandexGPT в минуту. ---
+        if not gpt_limiter.allow():
+            logger.warning("Глобальный лимит YandexGPT исчерпан — отвечаем отказом.")
+            await reply(OVERLOAD_MESSAGE)
+            return
+
         try:
-            answer = await yandex_gpt.generate_answer(question, result.chunks)
+            async with gpt_sem:
+                answer = await yandex_gpt.generate_answer(question, result.chunks)
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка вызова YandexGPT")
             await reply("Сервис ответов временно недоступен. Попробуйте позже.")
@@ -90,7 +154,11 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
     @dp.message()
     async def on_other(message: Message) -> None:
         # Не текст (фото, стикеры и т.п.) — вежливо просим текст.
-        await message.answer("Пожалуйста, задайте вопрос текстом.")
+        # Тот же rate limit: флуд стикерами не должен получать ответ на каждый.
+        user_id = message.from_user.id if message.from_user else 0
+        allowed, _ = user_limiter.check(user_id)
+        if allowed:
+            await message.answer("Пожалуйста, задайте вопрос текстом.")
 
     return dp
 
