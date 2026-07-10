@@ -92,6 +92,22 @@ def build_user_message(question: str, chunks: List[Chunk]) -> str:
     )
 
 
+# Общий HTTP-клиент с пулом соединений: под нагрузкой не создаём новое
+# TLS-соединение на каждый запрос. Лимиты пула — потолок одновременных
+# соединений к YandexGPT (дополнительно к семафору в bot.py).
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _client
+
+
 async def generate_answer(question: str, chunks: List[Chunk], timeout: float = 30.0) -> str:
     """Вызывает YandexGPT и возвращает текст ответа.
 
@@ -119,10 +135,12 @@ async def generate_answer(question: str, chunks: List[Chunk], timeout: float = 3
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(YANDEX_COMPLETION_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    client = _get_client()
+    resp = await client.post(
+        YANDEX_COMPLETION_URL, json=payload, headers=headers, timeout=timeout
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     # Формат ответа: result.alternatives[0].message.text
     try:
