@@ -1,0 +1,16 @@
+# Секреты
+.env
+
+# Кеш индекса (пересчитывается автоматически; не коммитим)
+knowledge_base/.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Кеш моделей sentence-transformers / huggingface (если окажется в проекте)
+.cache/

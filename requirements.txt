@@ -1,0 +1,21 @@
+# Telegram-бот (async, long polling)
+aiogram==3.13.1
+
+# HTTP-клиент для YandexGPT REST API
+httpx==0.27.2
+
+# Извлечение текста и изображений из PDF (чистый текст на кириллице)
+PyMuPDF==1.24.10
+
+# OCR распознавание текста на изображениях страниц (нужен системный tesseract-ocr-rus)
+pytesseract==0.3.13
+Pillow==10.4.0
+
+# Локальные эмбеддинги (без платных API). Тянет за собой torch/transformers.
+sentence-transformers==3.1.1
+
+# Векторный поиск в памяти (косинусное сходство)
+numpy==1.26.4
+
+# Локальная загрузка .env (на Railway не используется, переменные — в Variables)
+python-dotenv==1.0.1
