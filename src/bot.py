@@ -20,6 +20,10 @@ from . import yandex_gpt
 
 logger = logging.getLogger(__name__)
 
+# Временное сообщение-«раздумье»: показывается сразу после вопроса и
+# самоудаляется, когда готов настоящий ответ.
+THINKING_MESSAGE = "🔎 Ищу ответ в базе знаний…"
+
 # Фиксированный ответ, когда в базе знаний ничего релевантного не нашлось.
 NO_ANSWER_MESSAGE = (
     "Не нашёл ответа на этот вопрос в базе знаний. "
@@ -47,26 +51,41 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
         if not question:
             return
 
+        # Мгновенная обратная связь: сообщение-«раздумье». Отправляем сразу, чтобы
+        # пользователь видел, что бот принял вопрос и работает (поиск + генерация
+        # YandexGPT занимают несколько секунд), а не решил, что бот завис.
+        # Удалим его, как только будет готов настоящий ответ.
+        thinking = await message.answer(THINKING_MESSAGE)
+
+        async def reply(text: str) -> None:
+            """Убрать «раздумье» и прислать финальный ответ."""
+            # Удаление в try: сообщение могло быть уже удалено/устарело — не критично.
+            try:
+                await thinking.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await message.answer(text)
+
         try:
             result = retrieve(index, embedding_model, question, threshold=SIMILARITY_THRESHOLD)
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка на этапе retrieval")
-            await message.answer("Произошла внутренняя ошибка при поиске. Попробуйте позже.")
+            await reply("Произошла внутренняя ошибка при поиске. Попробуйте позже.")
             return
 
         # Порог не пройден → не тратим деньги на YandexGPT, отвечаем фиксированно.
         if not result.passed_threshold:
-            await message.answer(NO_ANSWER_MESSAGE)
+            await reply(NO_ANSWER_MESSAGE)
             return
 
         try:
             answer = await yandex_gpt.generate_answer(question, result.chunks)
         except Exception:  # noqa: BLE001
             logger.exception("Ошибка вызова YandexGPT")
-            await message.answer("Сервис ответов временно недоступен. Попробуйте позже.")
+            await reply("Сервис ответов временно недоступен. Попробуйте позже.")
             return
 
-        await message.answer(answer or NO_ANSWER_MESSAGE)
+        await reply(answer or NO_ANSWER_MESSAGE)
 
     @dp.message()
     async def on_other(message: Message) -> None:
