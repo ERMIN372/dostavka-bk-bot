@@ -19,7 +19,7 @@ import logging
 import os
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from .indexer import Index
@@ -28,6 +28,15 @@ from .throttling import GlobalRateLimiter, UserRateLimiter
 from . import yandex_gpt
 
 logger = logging.getLogger(__name__)
+
+# Telegram-ID администраторов, которым доступна команда /debug (диагностика
+# ретривера прямо в чате). Задаётся через переменную окружения DEBUG_ADMIN_IDS
+# (список ID через запятую). Пусто → команда недоступна никому и невидима.
+DEBUG_ADMIN_IDS = {
+    int(x)
+    for x in os.environ.get("DEBUG_ADMIN_IDS", "").replace(" ", "").split(",")
+    if x.isdigit()
+}
 
 # Временное сообщение-«раздумье»: показывается сразу после вопроса и
 # самоудаляется, когда готов настоящий ответ.
@@ -75,6 +84,37 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
     @dp.message(Command("start", "help"))
     async def on_start(message: Message) -> None:
         await message.answer(WELCOME_MESSAGE)
+
+    @dp.message(Command("debug"))
+    async def on_debug(message: Message, command: CommandObject) -> None:
+        """Диагностика ретривера (только для админов из DEBUG_ADMIN_IDS).
+
+        Показывает top-k чанков со score, порог и решение «идти ли в GPT» — чтобы
+        понять, почему на вопрос пришёл (или не пришёл) ответ. Обычным
+        пользователям команда не отвечает вовсе (как будто её нет).
+        """
+        user_id = message.from_user.id if message.from_user else 0
+        if user_id not in DEBUG_ADMIN_IDS:
+            return
+        query = (command.args or "").strip()
+        if not query:
+            await message.answer(
+                f"Ваш Telegram-ID: {user_id}\nИспользование: /debug <вопрос>"
+            )
+            return
+
+        result = await asyncio.to_thread(
+            retrieve, index, embedding_model, query, threshold=SIMILARITY_THRESHOLD,
+        )
+        lines = [
+            f"max_score={result.max_score:.3f} | порог={SIMILARITY_THRESHOLD} "
+            f"| к GPT: {'ДА' if result.passed_threshold else 'НЕТ'}",
+            "",
+        ]
+        for i, (c, s) in enumerate(zip(result.chunks, result.scores), 1):
+            head = " ".join(c.text.split())[:120]
+            lines.append(f"{i}. {s:.3f} (стр.{c.page_start}-{c.page_end}) {head}")
+        await message.answer("\n".join(lines)[:4000])
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
