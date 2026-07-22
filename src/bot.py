@@ -107,13 +107,19 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
             retrieve, index, embedding_model, query, threshold=SIMILARITY_THRESHOLD,
         )
         lines = [
-            f"max_score={result.max_score:.3f} | порог={SIMILARITY_THRESHOLD} "
+            f"max_cos={result.max_score:.3f} | порог={SIMILARITY_THRESHOLD} "
             f"| к GPT: {'ДА' if result.passed_threshold else 'НЕТ'}",
+            "гибрид = 0.7·cos + 0.3·bm25",
             "",
         ]
-        for i, (c, s) in enumerate(zip(result.chunks, result.scores), 1):
-            head = " ".join(c.text.split())[:120]
-            lines.append(f"{i}. {s:.3f} (стр.{c.page_start}-{c.page_end}) {head}")
+        for i, (c, s, cs, ls) in enumerate(
+            zip(result.chunks, result.scores, result.cos_scores, result.lex_scores), 1
+        ):
+            head = " ".join(c.text.split())[:110]
+            lines.append(
+                f"{i}. {s:.3f} (cos {cs:.3f} | lex {ls:.2f}) "
+                f"(стр.{c.page_start}-{c.page_end}) {head}"
+            )
         await message.answer("\n".join(lines)[:4000])
 
     @dp.message(F.text)
