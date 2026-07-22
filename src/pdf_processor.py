@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from dataclasses import dataclass
 from typing import List
 
@@ -38,9 +39,23 @@ OCR_LANG = "rus+eng"
 
 # Параметры чанкинга. Токены оцениваются приблизительно (см. _estimate_tokens):
 # точный токенайзер не нужен, важен порядок величины для стабильных размеров чанков.
-CHUNK_TARGET_TOKENS = 650   # целевой размер чанка (~500-800 токенов)
+#
+# ВАЖНО: база знаний — слайдовые PDF (~100-150 токенов текста на страницу),
+# где каждая страница = отдельная тема. Крупные чанки (600+) склеивали 5-6
+# разнотемных слайдов, из-за чего поиск переставал различать темы (score
+# слипались), а нужное правило тонуло в чужом контексте. Поэтому целевой размер
+# небольшой, а границы страниц — предпочтительные границы чанков.
+CHUNK_TARGET_TOKENS = 350   # целевой размер чанка (~2-3 слайда)
 CHUNK_OVERLAP_TOKENS = 100  # overlap между соседними чанками
 MIN_CHUNK_TOKENS = 40       # слишком короткие хвосты не выделяем в отдельный чанк
+
+# --- Фильтр OCR-мусора ---
+# Скриншоты интерфейсов в PDF дают на OCR кашу вида «Bee craryes! neces a *з
+# Datsun on-D0». Такая каша попадала в чанки и портила и поиск, и контекст GPT.
+# Оставляем только строки, похожие на осмысленный русский текст.
+OCR_MIN_CYRILLIC_RATIO = 0.7  # доля кириллицы среди букв строки
+OCR_MIN_RUS_WORDS = 2         # минимум русских слов (3+ буквы) в строке
+OCR_MAX_CHARS_PER_PAGE = 600  # OCR — доп. контекст; не даём ему задавить текст слайда
 
 
 @dataclass
@@ -62,8 +77,44 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+_RUS_WORD_RE = re.compile(r"[а-яё]{3,}", re.IGNORECASE)
+
+
+def _looks_like_russian(line: str) -> bool:
+    """Строка похожа на осмысленный русский текст (а не OCR-кашу со скриншота)."""
+    letters = [ch for ch in line if ch.isalpha()]
+    if len(letters) < 6:
+        return False
+    cyr = sum(1 for ch in letters if "а" <= ch.lower() <= "я" or ch.lower() == "ё")
+    if cyr / len(letters) < OCR_MIN_CYRILLIC_RATIO:
+        return False
+    return len(_RUS_WORD_RE.findall(line)) >= OCR_MIN_RUS_WORDS
+
+
+def _clean_ocr_text(text: str) -> str:
+    """Отсекает OCR-мусор: оставляет только русскоязычные строки, дедуплицирует,
+    ограничивает объём (OCR — вспомогательный контекст, не основной текст)."""
+    seen: set[str] = set()
+    kept: List[str] = []
+    total = 0
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if not line or not _looks_like_russian(line):
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if total + len(line) > OCR_MAX_CHARS_PER_PAGE:
+            break
+        kept.append(line)
+        total += len(line)
+    return "\n".join(kept)
+
+
 def _ocr_page_images(page: "fitz.Page", doc: "fitz.Document") -> str:
-    """OCR по всем растровым изображениям страницы. Возвращает распознанный текст."""
+    """OCR по всем растровым изображениям страницы. Возвращает распознанный текст,
+    очищенный от мусора (см. _clean_ocr_text)."""
     ocr_parts: List[str] = []
     for img in page.get_images(full=True):
         xref = img[0]
@@ -76,7 +127,7 @@ def _ocr_page_images(page: "fitz.Page", doc: "fitz.Document") -> str:
                 ocr_parts.append(recognized)
         except Exception as exc:  # noqa: BLE001 — не валим индексацию из-за одной картинки
             logger.warning("OCR не удался для изображения xref=%s: %s", xref, exc)
-    return "\n".join(ocr_parts)
+    return _clean_ocr_text("\n".join(ocr_parts))
 
 
 def _extract_pages(pdf_path: str) -> List[tuple[int, str]]:
@@ -121,70 +172,88 @@ def _split_paragraphs(text: str) -> List[str]:
     return paragraphs
 
 
-def _chunk_pages(pages: List[tuple[int, str]], source: str) -> List[Chunk]:
-    """Собирает страницы в единый поток абзацев и режет на чанки с overlap.
-
-    Чанкинг идёт по смысловым границам (абзацам): абзацы накапливаются в чанк,
-    пока не достигнут целевой размер; при переполнении часть последних абзацев
-    (~overlap токенов) переносится в начало следующего чанка.
-    """
-    # Плоский список (страница, абзац) — чтобы знать примерный диапазон страниц.
-    units: List[tuple[int, str]] = []
-    for page_num, page_text in pages:
-        for para in _split_paragraphs(page_text):
-            units.append((page_num, para))
-
+def _split_long_page(page_num: int, page_text: str, source: str) -> List[Chunk]:
+    """Редкая длинная страница (больше целевого размера) — режем по абзацам с overlap."""
+    paragraphs = _split_paragraphs(page_text)
     chunks: List[Chunk] = []
-    cur_units: List[tuple[int, str]] = []
+    cur: List[str] = []
     cur_tokens = 0
+    for para in paragraphs:
+        pt = _estimate_tokens(para)
+        if cur and cur_tokens + pt > CHUNK_TARGET_TOKENS:
+            chunks.append(Chunk("\n\n".join(cur), source, page_num, page_num))
+            # overlap: последние абзацы на ~CHUNK_OVERLAP_TOKENS
+            keep: List[str] = []
+            kt = 0
+            for p in reversed(cur):
+                t = _estimate_tokens(p)
+                if kt + t > CHUNK_OVERLAP_TOKENS and keep:
+                    break
+                keep.insert(0, p)
+                kt += t
+            cur, cur_tokens = keep, kt
+        cur.append(para)
+        cur_tokens += pt
+    if cur:
+        chunks.append(Chunk("\n\n".join(cur), source, page_num, page_num))
+    return chunks
+
+
+def _chunk_pages(pages: List[tuple[int, str]], source: str) -> List[Chunk]:
+    """Режет документ на чанки, предпочитая границы СТРАНИЦ как смысловые границы.
+
+    База знаний — слайдовые PDF: одна страница = одна тема. Поэтому чанк — это
+    1-3 соседние страницы до целевого размера; страница никогда не рвётся на
+    середине (кроме редких страниц длиннее целевого размера — их режем по
+    абзацам). Overlap — последняя страница предыдущего чанка повторяется в
+    начале следующего, если она короче ~CHUNK_OVERLAP_TOKENS.
+    """
+    chunks: List[Chunk] = []
+    cur_pages: List[tuple[int, str]] = []
+    cur_tokens = 0
+    carried_only = False  # в cur_pages лежит только overlap-страница из прошлого чанка
 
     def flush() -> None:
-        nonlocal cur_units, cur_tokens
-        if not cur_units:
+        nonlocal cur_pages, cur_tokens, carried_only
+        if not cur_pages:
             return
-        text = "\n\n".join(u[1] for u in cur_units).strip()
-        if not text:
-            cur_units, cur_tokens = [], 0
-            return
-        chunks.append(
-            Chunk(
-                text=text,
-                source=source,
-                page_start=cur_units[0][0],
-                page_end=cur_units[-1][0],
-            )
-        )
-        # Формируем overlap: тянем абзацы с конца, пока не наберём ~overlap токенов.
-        overlap: List[tuple[int, str]] = []
-        overlap_tokens = 0
-        for unit in reversed(cur_units):
-            t = _estimate_tokens(unit[1])
-            if overlap_tokens + t > CHUNK_OVERLAP_TOKENS and overlap:
-                break
-            overlap.insert(0, unit)
-            overlap_tokens += t
-        cur_units = overlap
-        cur_tokens = overlap_tokens
-
-    for page_num, para in units:
-        para_tokens = _estimate_tokens(para)
-        if cur_tokens + para_tokens > CHUNK_TARGET_TOKENS and cur_tokens >= MIN_CHUNK_TOKENS:
-            flush()
-        cur_units.append((page_num, para))
-        cur_tokens += para_tokens
-
-    # Финальный хвост.
-    if cur_units:
-        text = "\n\n".join(u[1] for u in cur_units).strip()
+        text = "\n\n".join(p[1] for p in cur_pages).strip()
         if text:
             chunks.append(
-                Chunk(
-                    text=text,
-                    source=source,
-                    page_start=cur_units[0][0],
-                    page_end=cur_units[-1][0],
-                )
+                Chunk(text, source, cur_pages[0][0], cur_pages[-1][0])
             )
+        # Overlap: тянем последнюю страницу в следующий чанк, только если она
+        # короткая (иначе чанки будут почти дублироваться).
+        last_num, last_text = cur_pages[-1]
+        last_tokens = _estimate_tokens(last_text)
+        if last_tokens <= CHUNK_OVERLAP_TOKENS:
+            cur_pages, cur_tokens = [(last_num, last_text)], last_tokens
+            carried_only = True
+        else:
+            cur_pages, cur_tokens = [], 0
+            carried_only = False
+
+    for page_num, page_text in pages:
+        ptoks = _estimate_tokens(page_text)
+
+        # Аномально длинная страница — отдельная обработка, по абзацам.
+        if ptoks > CHUNK_TARGET_TOKENS:
+            flush()
+            cur_pages, cur_tokens, carried_only = [], 0, False
+            chunks.extend(_split_long_page(page_num, page_text, source))
+            continue
+
+        if cur_pages and cur_tokens + ptoks > CHUNK_TARGET_TOKENS:
+            flush()
+        cur_pages.append((page_num, page_text))
+        cur_tokens += ptoks
+        carried_only = False
+
+    # Финальный хвост — но не дублируем чанк, состоящий из одной overlap-страницы.
+    if cur_pages and not carried_only:
+        text = "\n\n".join(p[1] for p in cur_pages).strip()
+        if text:
+            chunks.append(Chunk(text, source, cur_pages[0][0], cur_pages[-1][0]))
 
     return chunks
 

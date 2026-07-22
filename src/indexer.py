@@ -38,6 +38,10 @@ EMBEDDING_MODEL_NAME = os.environ.get(
     "EMBEDDING_MODEL_NAME", "intfloat/multilingual-e5-large"
 )
 
+# Версия конвейера обработки PDF (чанкер/OCR-фильтр). При изменении логики
+# нарезки бампается, чтобы кеш с чанками старого формата не пережил обновление.
+PIPELINE_VERSION = "page-chunks-v2"
+
 CACHE_DIR_NAME = ".cache"
 EMBEDDINGS_FILE = "embeddings.npz"
 META_FILE = "meta.json"
@@ -121,6 +125,9 @@ def _load_cache(knowledge_base_dir: str, files_hash: str) -> Index | None:
         if meta.get("model_name") != EMBEDDING_MODEL_NAME:
             logger.info("Изменилась модель эмбеддингов — кеш будет пересчитан.")
             return None
+        if meta.get("pipeline_version") != PIPELINE_VERSION:
+            logger.info("Изменилась версия чанкера — кеш будет пересчитан.")
+            return None
 
         data = np.load(emb_path, allow_pickle=True)
         embeddings = data["embeddings"].astype(np.float32)
@@ -166,6 +173,7 @@ def _save_cache(
             {
                 "files_hash": files_hash,
                 "model_name": EMBEDDING_MODEL_NAME,
+                "pipeline_version": PIPELINE_VERSION,
                 "dim": int(embeddings.shape[1]) if embeddings.size else 0,
                 "num_chunks": len(chunks),
             },
