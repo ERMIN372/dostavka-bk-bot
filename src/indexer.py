@@ -28,6 +28,7 @@ from typing import List
 
 import numpy as np
 
+from .md_processor import process_markdown
 from .pdf_processor import Chunk, process_pdf
 
 logger = logging.getLogger(__name__)
@@ -38,9 +39,14 @@ EMBEDDING_MODEL_NAME = os.environ.get(
     "EMBEDDING_MODEL_NAME", "intfloat/multilingual-e5-large"
 )
 
-# Версия конвейера обработки PDF (чанкер/OCR-фильтр). При изменении логики
+# Версия конвейера обработки (чанкер/OCR-фильтр/md-парсер). При изменении логики
 # нарезки бампается, чтобы кеш с чанками старого формата не пережил обновление.
-PIPELINE_VERSION = "page-chunks-v2"
+PIPELINE_VERSION = "qa-md-v3"
+
+# Поддерживаемые форматы базы знаний. Markdown в формате Q&A (### вопрос → ответ)
+# предпочтителен: одна пара = один точный чанк. PDF поддерживается для
+# документов, которых нет в текстовом виде.
+SUPPORTED_EXTENSIONS = (".pdf", ".md")
 
 CACHE_DIR_NAME = ".cache"
 EMBEDDINGS_FILE = "embeddings.npz"
@@ -56,14 +62,22 @@ class Index:
     model_name: str
 
 
-def _iter_pdf_files(knowledge_base_dir: str) -> List[str]:
-    """Возвращает отсортированный список путей к PDF в папке базы знаний."""
+def _iter_source_files(knowledge_base_dir: str) -> List[str]:
+    """Возвращает отсортированный список файлов базы знаний (.pdf, .md)."""
     files: List[str] = []
     for name in sorted(os.listdir(knowledge_base_dir)):
         full = os.path.join(knowledge_base_dir, name)
-        if os.path.isfile(full) and name.lower().endswith(".pdf"):
+        if os.path.isfile(full) and name.lower().endswith(SUPPORTED_EXTENSIONS):
             files.append(full)
     return files
+
+
+def _process_source_file(path: str) -> List[Chunk]:
+    """Диспетчер по расширению: PDF → текст+OCR+чанкинг, MD → Q&A-пары."""
+    name = os.path.basename(path)
+    if name.lower().endswith(".md"):
+        return process_markdown(path, name)
+    return process_pdf(path, name)
 
 
 def _compute_files_hash(pdf_files: List[str]) -> str:
@@ -190,21 +204,21 @@ def build_or_load_index(knowledge_base_dir: str, model=None) -> Index:
     model — уже загруженная модель эмбеддингов (чтобы не грузить её дважды).
     Если None и требуется пересчёт — модель будет загружена здесь.
 
-    Кидает RuntimeError, если в knowledge_base нет ни одного PDF — бот без базы
-    знаний бессмысленен, лучше явно упасть при старте.
+    Кидает RuntimeError, если в knowledge_base нет ни одного файла базы знаний —
+    бот без базы знаний бессмысленен, лучше явно упасть при старте.
     """
     if not os.path.isdir(knowledge_base_dir):
         raise RuntimeError(f"Папка базы знаний не найдена: {knowledge_base_dir}")
 
-    pdf_files = _iter_pdf_files(knowledge_base_dir)
-    if not pdf_files:
+    source_files = _iter_source_files(knowledge_base_dir)
+    if not source_files:
         raise RuntimeError(
-            f"В {knowledge_base_dir} нет ни одного PDF-файла. "
-            "Положите PDF с инструкциями в эту папку и перезапустите бота."
+            f"В {knowledge_base_dir} нет ни одного файла базы знаний (.pdf/.md). "
+            "Положите файл с инструкциями в эту папку и перезапустите бота."
         )
 
-    logger.info("Найдено PDF-файлов: %d", len(pdf_files))
-    files_hash = _compute_files_hash(pdf_files)
+    logger.info("Найдено файлов базы знаний: %d", len(source_files))
+    files_hash = _compute_files_hash(source_files)
 
     cached = _load_cache(knowledge_base_dir, files_hash)
     if cached is not None:
@@ -212,13 +226,13 @@ def build_or_load_index(knowledge_base_dir: str, model=None) -> Index:
 
     # --- Пересчёт индекса ---
     all_chunks: List[Chunk] = []
-    for path in pdf_files:
-        all_chunks.extend(process_pdf(path, os.path.basename(path)))
+    for path in source_files:
+        all_chunks.extend(_process_source_file(path))
 
     if not all_chunks:
         raise RuntimeError(
-            "Из PDF не удалось извлечь ни одного текстового чанка. "
-            "Проверьте, что PDF не пустой и установлен tesseract-ocr(-rus)."
+            "Из файлов базы знаний не удалось извлечь ни одного чанка. "
+            "Проверьте, что файлы не пустые (для PDF — что установлен tesseract-ocr-rus)."
         )
 
     if model is None:
