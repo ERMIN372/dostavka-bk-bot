@@ -50,7 +50,24 @@ NO_ANSWER_MESSAGE = (
 
 WELCOME_MESSAGE = (
     "Здравствуйте! Я бот-помощник службы доставки БК «ТД Нефтьмагистраль».\n"
-    "Задайте вопрос по инструкции доставки обычным текстом — я найду ответ в базе знаний."
+    "Задайте вопрос по инструкции доставки обычным текстом — я найду ответ в базе знаний.\n\n"
+    "/shablon — шаблон сообщения о проблемном заказе для чата поддержки."
+)
+
+# Шаблон обращения по проблемному заказу. Введён по итогам анализа чата
+# поддержки: 58% живых обращений — свободная переписка вокруг заказов без
+# единой структуры, из-за чего диспетчеры тратят время на уточняющие вопросы.
+TEMPLATE_MESSAGE = (
+    "Шаблон сообщения о проблемном заказе — скопируйте, заполните и отправьте "
+    "в чат поддержки:\n\n"
+    "Точка: М__\n"
+    "Номер заказа: \n"
+    "Источник: МП / Яндекс.Еда / Купер / касса\n"
+    "Телефон гостя: \n"
+    "Проблема (одной фразой): \n"
+    "Что уже сделали: \n"
+    "Какая помощь нужна: \n\n"
+    "Для предзаказа дополнительно укажите дату/время выдачи и статус предоплаты."
 )
 
 RATE_LIMIT_MESSAGE = (
@@ -84,6 +101,10 @@ def create_dispatcher(index: Index, embedding_model) -> Dispatcher:
     @dp.message(Command("start", "help"))
     async def on_start(message: Message) -> None:
         await message.answer(WELCOME_MESSAGE)
+
+    @dp.message(Command("shablon"))
+    async def on_template(message: Message) -> None:
+        await message.answer(TEMPLATE_MESSAGE)
 
     @dp.message(Command("debug"))
     async def on_debug(message: Message, command: CommandObject) -> None:
